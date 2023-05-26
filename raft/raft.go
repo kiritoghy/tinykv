@@ -457,6 +457,17 @@ func (r *Raft) sendVoteResp(to uint64, reject bool) {
 	r.msgs = append(r.msgs, m)
 }
 
+func (r *Raft) sendHeartbeatResp(to uint64, reject bool) {
+	m := pb.Message{
+		MsgType: pb.MessageType_MsgHeartbeatResponse,
+		From:    r.id,
+		To:      to,
+		Term:    r.Term,
+		Reject:  reject,
+	}
+	r.msgs = append(r.msgs, m)
+}
+
 func (r *Raft) stepFollower(m pb.Message) {
 	switch m.MsgType {
 	case pb.MessageType_MsgHup:
@@ -519,11 +530,15 @@ func (r *Raft) Step(m pb.Message) error {
 // handleAppendEntries handle AppendEntries RPC request
 func (r *Raft) handleAppendEntries(m pb.Message) {
 	// Your Code Here (2A).
+
 }
 
 // handleHeartbeat handle Heartbeat RPC request
 func (r *Raft) handleHeartbeat(m pb.Message) {
 	// Your Code Here (2A).
+	r.reset(m.Term)
+	r.Lead = m.From
+	r.sendHeartbeatResp()
 }
 
 func (r *Raft) handleVoteReq(m pb.Message) {
