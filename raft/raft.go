@@ -137,6 +137,8 @@ type Raft struct {
 	heartbeatTimeout int
 	// baseline of election interval
 	electionTimeout int
+
+	randomizedElectionTimeout int
 	// number of ticks since it reached last heartbeatTimeout.
 	// only leader keeps heartbeatElapsed.
 	heartbeatElapsed int
@@ -211,7 +213,7 @@ func (r *Raft) loadState(state pb.HardState) {
 }
 
 func (r *Raft) resetRandomizedElectionTimeout() {
-	r.electionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
+	r.randomizedElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
 }
 
 func (r *Raft) reset(term uint64) {
@@ -289,7 +291,8 @@ func (r *Raft) tick() {
 
 func (r *Raft) tickElection() {
 	r.electionElapsed++
-	if r.electionElapsed >= r.electionTimeout {
+	// log.Infof("%x electionElapsed %d, electiontimeout is %d", r.id, r.electionElapsed, r.electionTimeout)
+	if r.electionElapsed >= r.randomizedElectionTimeout {
 		r.electionElapsed = 0
 		r.Step(pb.Message{MsgType: pb.MessageType_MsgHup})
 	}
@@ -413,6 +416,24 @@ func (r *Raft) bCastVoteReq() {
 	}
 }
 
+func (r *Raft) bCastAppend() {
+	for id := range r.Prs {
+		if id == r.id {
+			continue
+		}
+		r.sendAppend(id)
+	}
+}
+
+func (r *Raft) bCastHeartbeat() {
+	for id := range r.Prs {
+		if id == r.id {
+			continue
+		}
+		r.sendHeartbeat(id)
+	}
+}
+
 func (r *Raft) sendVoteReq(id uint64) {
 	m := pb.Message{
 		MsgType: pb.MessageType_MsgRequestVote,
@@ -425,20 +446,54 @@ func (r *Raft) sendVoteReq(id uint64) {
 	r.msgs = append(r.msgs, m)
 }
 
+func (r *Raft) sendVoteResp(to uint64, reject bool) {
+	m := pb.Message{
+		MsgType: pb.MessageType_MsgRequestVoteResponse,
+		From:    r.id,
+		To:      to,
+		Term:    r.Term,
+		Reject:  reject,
+	}
+	r.msgs = append(r.msgs, m)
+}
+
 func (r *Raft) stepFollower(m pb.Message) {
 	switch m.MsgType {
 	case pb.MessageType_MsgHup:
 		r.campaign()
 	case pb.MessageType_MsgRequestVote:
-
+		r.handleVoteReq(m)
+	case pb.MessageType_MsgAppend:
+		r.handleAppendEntries(m)
+	case pb.MessageType_MsgHeartbeat:
+		r.handleHeartbeat(m)
 	}
 }
 
 func (r *Raft) stepCandidate(m pb.Message) {
-
+	switch m.MsgType {
+	case pb.MessageType_MsgHup:
+		r.campaign()
+	case pb.MessageType_MsgRequestVote:
+		r.handleVoteReq(m)
+	case pb.MessageType_MsgRequestVoteResponse:
+		r.handleVoteResp(m)
+	case pb.MessageType_MsgHeartbeat:
+		r.becomeFollower(m.Term, m.From)
+		r.handleHeartbeat(m)
+	case pb.MessageType_MsgAppend:
+		r.becomeFollower(m.Term, m.From)
+		r.handleAppendEntries(m)
+	}
 }
 
 func (r *Raft) stepLeader(m pb.Message) {
+	switch m.MsgType {
+	case pb.MessageType_MsgRequestVote:
+		r.handleVoteReq(m)
+	case pb.MessageType_MsgBeat:
+		r.bCastHeartbeat()
+	}
 
 }
 
@@ -446,6 +501,10 @@ func (r *Raft) stepLeader(m pb.Message) {
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
+	if r.Term < m.Term {
+		log.Infof("%x [term: %d] received a %s message with higher term from %x [term: %d]", r.id, r.Term, m.MsgType, m.From, m.Term)
+		r.becomeFollower(m.Term, None)
+	}
 	switch r.State {
 	case StateFollower:
 		r.stepFollower(m)
@@ -469,37 +528,30 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 
 func (r *Raft) handleVoteReq(m pb.Message) {
 
-	if r.Term < m.Term {
-		r.becomeFollower(m.Term, None)
-	}
-
 	canVote := r.Vote == m.From || (r.Vote == None && r.Lead == None) || (m.Term > r.Term)
 
 	if canVote && r.RaftLog.IsUpToDate(m.Index, m.LogTerm) {
 		log.Infof("%x [logterm: %d, index: %d, vote: %x] cast %s for %x [logterm: %d, index: %d] at term %d",
 			r.id, r.RaftLog.LastTerm(), r.RaftLog.LastIndex(), r.Vote, m.MsgType, m.From, m.LogTerm, m.Index, r.Term)
-		r.sendVoteResp(m.From, true)
+		r.sendVoteResp(m.From, false)
 		r.electionElapsed = 0
 		r.Vote = m.From
 	} else {
 		log.Infof("%x [logterm: %d, index: %d, vote: %x] reject %s for %x [logterm: %d, index: %d] at term %d",
 			r.id, r.RaftLog.LastTerm(), r.RaftLog.LastIndex(), r.Vote, m.MsgType, m.From, m.LogTerm, m.Index, r.Term)
-		r.sendVoteResp(m.From, false)
-	}
-
-	if r.Term < m.Term {
-		r.becomeFollower(m.Term, None)
-	}
-
-	if r.Vote != None && r.Vote != m.From {
-		r.sendVoteResp(m.From, false)
-		return
-	}
-
-	if r.RaftLog.IsUpToDate(m.Index, m.LogTerm) {
 		r.sendVoteResp(m.From, true)
-	} else {
-		r.sendVoteResp(m.From, false)
+	}
+}
+
+func (r *Raft) handleVoteResp(m pb.Message) {
+	gr, rj, res := r.poll(m.From, m.MsgType, !m.Reject)
+	log.Infof("%x has received %d %s votes and %d vote rejections", r.id, gr, m.MsgType, rj)
+	switch res {
+	case VoteWon:
+		r.becomeLeader()
+		r.bCastAppend()
+	case VoteLost:
+		r.becomeFollower(r.Term, None)
 	}
 }
 

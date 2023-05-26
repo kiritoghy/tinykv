@@ -85,7 +85,7 @@ func newLog(storage Storage) *RaftLog {
 	log.entries = entries
 	log.stabled = lastIndex
 	log.firstIndex = firstIndex
-	return nil
+	return log
 }
 
 // We need to compact the log entries in some point of time like
@@ -179,4 +179,8 @@ func (l *RaftLog) appliedTo(i uint64) {
 		log.Panicf("applied(%d) is out of range [prevApplied(%d), committed(%d)]", i, l.applied, l.committed)
 	}
 	l.applied = i
+}
+
+func (l *RaftLog) IsUpToDate(lastIndex, term uint64) bool {
+	return term > l.LastTerm() || (term == l.LastTerm() && lastIndex >= l.LastIndex())
 }
